@@ -222,6 +222,94 @@ def deepface_emotion_from_crop(
     return detections
 
 
+@st.cache_resource(show_spinner="Memuat model Hugging Face...")
+def get_hf_pipeline(model_name: str) -> Any:
+    print(f"[LOG] Sedang memuat model Hugging Face: {model_name}...")
+    from transformers import pipeline
+    pipe = pipeline("image-classification", model=model_name)
+    print(f"[LOG] Model Hugging Face {model_name} berhasil dimuat!")
+    return pipe
+
+
+def detect_emotion_from_crop(
+    crop_bgr: Frame,
+    origin: tuple[int, int],
+    frame_shape: tuple[int, ...],
+    emotion_engine: str,
+    detector_backend: str,
+    direct_face_crop: bool,
+    store_error: bool = True,
+) -> list[EmotionDetection]:
+    # 1. Deteksi dan klasifikasi dasar menggunakan DeepFace
+    detections = deepface_emotion_from_crop(
+        crop_bgr=crop_bgr,
+        origin=origin,
+        frame_shape=frame_shape,
+        detector_backend=detector_backend,
+        direct_face_crop=direct_face_crop,
+        store_error=store_error,
+    )
+
+    if emotion_engine == "DeepFace (Default)" or not detections:
+        return detections
+
+    # 2. Jika memilih model Hugging Face, klasifikasikan ulang crop wajah
+    model_name = (
+        "dima806/facial_emotions_image_detection"
+        if emotion_engine == "Hugging Face ViT (dima806)"
+        else "trpakov/vit-face-expression"
+    )
+
+    try:
+        classifier = get_hf_pipeline(model_name)
+    except Exception as exc:
+        if store_error:
+            st.session_state["last_deepface_error"] = f"Gagal memuat model HF {model_name}: {exc}"
+        return detections
+
+    updated_detections = []
+    for det in detections:
+        x1, y1, x2, y2 = det.bbox
+        origin_x, origin_y = origin
+        rx1 = max(0, x1 - origin_x)
+        ry1 = max(0, y1 - origin_y)
+        rx2 = min(crop_bgr.shape[1], x2 - origin_x)
+        ry2 = min(crop_bgr.shape[0], y2 - origin_y)
+
+        face_crop = crop_bgr[ry1:ry2, rx1:rx2]
+        if face_crop.size == 0:
+            updated_detections.append(det)
+            continue
+
+        from PIL import Image
+        face_rgb = cv2.cvtColor(face_crop, cv2.COLOR_BGR2RGB)
+        pil_img = Image.fromarray(face_rgb)
+
+        try:
+            results = classifier(pil_img)
+            if results:
+                top_result = max(results, key=lambda x: x["score"])
+                emotion = str(top_result["label"]).lower()
+                score = float(top_result["score"]) * 100.0
+
+                updated_detections.append(
+                    EmotionDetection(
+                        bbox=det.bbox,
+                        emotion=emotion,
+                        score=score,
+                        source=f"hf-{model_name.split('/')[-1]}",
+                    )
+                )
+            else:
+                updated_detections.append(det)
+        except Exception as exc:
+            if store_error:
+                st.session_state["last_deepface_error"] = f"Klasifikasi HF gagal: {exc}"
+            updated_detections.append(det)
+
+    return updated_detections
+
+
 def should_treat_yolo_as_face_model(mode: str, class_names: dict[int, str]) -> bool:
     if mode == "Face model":
         return True
@@ -271,6 +359,7 @@ def process_frame(
     confidence: float,
     yolo_mode: str,
     deepface_backend: str,
+    emotion_engine: str,
     store_deepface_error: bool = True,
 ) -> tuple[Frame, list[EmotionDetection]]:
     annotated = frame_bgr.copy()
@@ -282,10 +371,11 @@ def process_frame(
 
         if use_face_boxes:
             detections.extend(
-                deepface_emotion_from_crop(
+                detect_emotion_from_crop(
                     crop,
                     origin=(x1, y1),
                     frame_shape=frame_bgr.shape,
+                    emotion_engine=emotion_engine,
                     detector_backend=deepface_backend,
                     direct_face_crop=True,
                     store_error=store_deepface_error,
@@ -295,10 +385,11 @@ def process_frame(
             cv2.rectangle(annotated, (x1, y1), (x2, y2), (145, 145, 145), 1)
             draw_label(annotated, f"{class_name} {box_conf:.2f}", x1, y1, (90, 90, 90))
             detections.extend(
-                deepface_emotion_from_crop(
+                detect_emotion_from_crop(
                     crop,
                     origin=(x1, y1),
                     frame_shape=frame_bgr.shape,
+                    emotion_engine=emotion_engine,
                     detector_backend=deepface_backend,
                     direct_face_crop=False,
                     store_error=store_deepface_error,
@@ -318,12 +409,14 @@ class RealtimeEmotionProcessor(VideoProcessorBase):
         confidence: float,
         yolo_mode: str,
         deepface_backend: str,
+        emotion_engine: str,
         frame_step: int,
     ) -> None:
         self.model = model
         self.confidence = confidence
         self.yolo_mode = yolo_mode
         self.deepface_backend = deepface_backend
+        self.emotion_engine = emotion_engine
         self.frame_step = frame_step
         self.frame_index = 0
         self.last_detections: list[EmotionDetection] = []
@@ -335,12 +428,14 @@ class RealtimeEmotionProcessor(VideoProcessorBase):
         confidence: float,
         yolo_mode: str,
         deepface_backend: str,
+        emotion_engine: str,
         frame_step: int,
     ) -> None:
         with self.lock:
             self.confidence = confidence
             self.yolo_mode = yolo_mode
             self.deepface_backend = deepface_backend
+            self.emotion_engine = emotion_engine
             self.frame_step = frame_step
 
     def get_counts(self) -> Counter[str]:
@@ -359,6 +454,7 @@ class RealtimeEmotionProcessor(VideoProcessorBase):
             confidence = self.confidence
             yolo_mode = self.yolo_mode
             deepface_backend = self.deepface_backend
+            emotion_engine = self.emotion_engine
             frame_step = max(1, self.frame_step)
             frame_index = self.frame_index
             self.frame_index += 1
@@ -371,6 +467,7 @@ class RealtimeEmotionProcessor(VideoProcessorBase):
                     confidence=confidence,
                     yolo_mode=yolo_mode,
                     deepface_backend=deepface_backend,
+                    emotion_engine=emotion_engine,
                     store_deepface_error=False,
                 )
                 with self.lock:
@@ -453,6 +550,7 @@ def process_video(
     confidence: float,
     yolo_mode: str,
     deepface_backend: str,
+    emotion_engine: str,
     frame_step: int,
     max_frames: int,
 ) -> Counter[str]:
@@ -491,6 +589,7 @@ def process_video(
                 confidence=confidence,
                 yolo_mode=yolo_mode,
                 deepface_backend=deepface_backend,
+                emotion_engine=emotion_engine,
             )
             counts.update(detection.emotion for detection in detections)
 
@@ -515,7 +614,7 @@ def process_video(
     return counts
 
 
-def load_models_from_sidebar() -> tuple[YOLO, str, float, str, int, int]:
+def load_models_from_sidebar() -> tuple[YOLO, str, float, str, str, int, int]:
     with st.sidebar:
         st.header("Pengaturan model")
         yolo_weights = st.text_input(
@@ -536,6 +635,14 @@ def load_models_from_sidebar() -> tuple[YOLO, str, float, str, int, int]:
             ),
         )
         confidence = st.slider("Confidence YOLO", 0.10, 0.90, 0.35, 0.05)
+
+        emotion_engine = st.radio(
+            "Mesin Deteksi Emosi",
+            options=["DeepFace (Default)", "Hugging Face ViT (dima806)", "Hugging Face ViT (trpakov)"],
+            index=0,
+            help="Pilih model kecerdasan buatan untuk mengklasifikasikan emosi wajah."
+        )
+
         deepface_backend = st.radio(
             "Backend deteksi wajah DeepFace", DEEPFACE_BACKENDS, index=0
         )
@@ -550,9 +657,15 @@ def load_models_from_sidebar() -> tuple[YOLO, str, float, str, int, int]:
         )
         max_frames = st.slider("Maksimal frame dianalisis", 10, 1000, 150, 10)
 
-    _ = warmup_deepface()
+    if emotion_engine == "DeepFace (Default)":
+        _ = warmup_deepface()
+    elif emotion_engine == "Hugging Face ViT (dima806)":
+        _ = get_hf_pipeline("dima806/facial_emotions_image_detection")
+    elif emotion_engine == "Hugging Face ViT (trpakov)":
+        _ = get_hf_pipeline("trpakov/vit-face-expression")
+
     model = load_yolo(yolo_weights.strip())
-    return model, yolo_mode, confidence, deepface_backend, frame_step, max_frames
+    return model, yolo_mode, confidence, deepface_backend, emotion_engine, frame_step, max_frames
 
 
 def show_last_deepface_error() -> None:
@@ -571,7 +684,7 @@ def main() -> None:
     )
 
     try:
-        model, yolo_mode, confidence, deepface_backend, frame_step, max_frames = (
+        model, yolo_mode, confidence, deepface_backend, emotion_engine, frame_step, max_frames = (
             load_models_from_sidebar()
         )
     except Exception as exc:
@@ -601,6 +714,7 @@ def main() -> None:
                         confidence=confidence,
                         yolo_mode=yolo_mode,
                         deepface_backend=deepface_backend,
+                        emotion_engine=emotion_engine,
                     )
                 st.image(
                     cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB),
@@ -627,6 +741,7 @@ def main() -> None:
                         confidence=confidence,
                         yolo_mode=yolo_mode,
                         deepface_backend=deepface_backend,
+                        emotion_engine=emotion_engine,
                         frame_step=frame_step,
                         max_frames=max_frames,
                     )
@@ -660,6 +775,7 @@ def main() -> None:
                                 confidence=confidence,
                                 yolo_mode=yolo_mode,
                                 deepface_backend=deepface_backend,
+                                emotion_engine=emotion_engine,
                                 frame_step=frame_step,
                                 max_frames=max_frames,
                             )
@@ -725,6 +841,7 @@ def main() -> None:
                     confidence=confidence,
                     yolo_mode=yolo_mode,
                     deepface_backend=deepface_backend,
+                    emotion_engine=emotion_engine,
                     frame_step=realtime_frame_step,
                 ),
                 async_processing=True,
@@ -735,6 +852,7 @@ def main() -> None:
                     confidence=confidence,
                     yolo_mode=yolo_mode,
                     deepface_backend=deepface_backend,
+                    emotion_engine=emotion_engine,
                     frame_step=realtime_frame_step,
                 )
                 if st.button("Reset ringkasan realtime"):
