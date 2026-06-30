@@ -1,0 +1,31 @@
+__pycache__/
+*.py[cod]
+
+# Environment
+.venv/
+venv/
+.env
+*.env
+
+# Streamlit secrets
+.streamlit/secrets.toml
+
+# Model outputs and downloaded media
+runs/
+downloads/
+*.mp4
+*.mov
+*.avi
+*.mkv
+*.webm
+
+# Large model weights
+*.pt
+models/*.pt
+!models/.gitkeep
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+.zed/
